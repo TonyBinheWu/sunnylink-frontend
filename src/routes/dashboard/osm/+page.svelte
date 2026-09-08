@@ -1,7 +1,17 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import { fade } from 'svelte/transition';
-	import { Map as MapIcon, Download, AlertCircle, Loader2, RefreshCw } from 'lucide-svelte';
+	import {
+		Map as MapIcon,
+		Download,
+		AlertCircle,
+		Loader2,
+		RefreshCw,
+		Eye,
+		EyeOff,
+		KeyRound,
+		Navigation
+	} from 'lucide-svelte';
 	import { deviceState } from '$lib/stores/device.svelte';
 	import { setDeviceParams, checkDeviceStatus, fetchSettingsAsync } from '$lib/api/device';
 	import { logtoClient, authState } from '$lib/logto/auth.svelte';
@@ -46,7 +56,9 @@
 	): void {
 		if (typeof localStorage === 'undefined') return;
 		try {
-			const entry: OsmCacheEntry = { params, timestamp: Date.now() };
+			// Never persist the Mapbox token in browser storage.
+			const cacheableParams = params.filter((param) => param.key !== 'MapboxPublicKey');
+			const entry: OsmCacheEntry = { params: cacheableParams, timestamp: Date.now() };
 			localStorage.setItem(`${OSM_CACHE_PREFIX}${deviceId}`, JSON.stringify(entry));
 		} catch {}
 	}
@@ -59,7 +71,10 @@
 		'OSMDownloadProgress',
 		'OsmDbUpdatesCheck',
 		'OsmDownloadedDate',
-		'OsmLocal'
+		'OsmLocal',
+		'MapboxPublicKey',
+		'NavigationEnabled',
+		'NavigationModelIntent'
 	];
 
 	let countries: OSMRegion[] = $state([]);
@@ -70,6 +85,10 @@
 	let clearingCache = $state(false);
 	let clearCacheModalOpen = $state(false);
 	let error = $state<string | null>(null);
+	let mapboxTokenInput = $state('');
+	let showMapboxToken = $state(false);
+	let savingMapboxToken = $state(false);
+	let savingNavigationSetting = $state<string | null>(null);
 
 	// Sync status indicator (consistent with settings pages)
 	let batchActive = $derived(
@@ -127,6 +146,10 @@
 		return decodeParamValue(param);
 	}
 
+	function paramBoolean(value: unknown): boolean {
+		return value === true || value === 1 || value === '1' || value === 'true';
+	}
+
 	// Derived values for the current device
 	let currentCountryName = $derived(
 		deviceState.selectedDeviceId
@@ -165,6 +188,21 @@
 	);
 	let osmLocalParam = $derived(
 		deviceState.selectedDeviceId ? getParamValue(deviceState.selectedDeviceId, 'OsmLocal') : null
+	);
+	let mapboxPublicKey = $derived(
+		deviceState.selectedDeviceId
+			? String(getParamValue(deviceState.selectedDeviceId, 'MapboxPublicKey') || '')
+			: ''
+	);
+	let navigationEnabled = $derived(
+		deviceState.selectedDeviceId
+			? paramBoolean(getParamValue(deviceState.selectedDeviceId, 'NavigationEnabled'))
+			: false
+	);
+	let navigationModelIntent = $derived(
+		deviceState.selectedDeviceId
+			? paramBoolean(getParamValue(deviceState.selectedDeviceId, 'NavigationModelIntent'))
+			: false
 	);
 
 	let hasMap = $derived(!!currentCountryName);
@@ -450,6 +488,79 @@
 		}
 	}
 
+	function updateLocalParam(deviceId: string, key: string, value: unknown, type: string) {
+		const encodedValue = encodeParamValue({ key, value, type });
+		if (encodedValue === null) return;
+
+		const existing = deviceState.deviceSettings[deviceId] || [];
+		const updated = existing.filter((item) => item.key !== key);
+		updated.push({ key, value: encodedValue, type, is_compressed: false } as any);
+		deviceState.deviceSettings[deviceId] = updated;
+		saveOsmCache(deviceId, updated.filter((item) => OSM_PARAMS.includes(item.key || '')) as any);
+	}
+
+	async function writeNavigationParam(key: string, value: unknown, type: 'String' | 'Bool') {
+		if (!deviceState.selectedDeviceId || !logtoClient) throw new Error('No device session');
+		const deviceId = deviceState.selectedDeviceId;
+		const token = await logtoClient.getIdToken();
+		if (!token) throw new Error('Session expired');
+
+		const encodedValue = encodeParamValue({ key, value, type });
+		if (encodedValue === null) throw new Error(`Failed to encode ${key}`);
+		await setDeviceParams(deviceId, [{ key, value: encodedValue, is_compressed: false }], token);
+		updateLocalParam(deviceId, key, value, type);
+	}
+
+	async function handleSaveMapboxToken() {
+		const publicToken = mapboxTokenInput.trim();
+		if (!publicToken.startsWith('pk.') || publicToken.length < 20) {
+			toast.error('Enter a valid Mapbox public token beginning with pk.');
+			return;
+		}
+
+		savingMapboxToken = true;
+		try {
+			await writeNavigationParam('MapboxPublicKey', publicToken, 'String');
+			mapboxTokenInput = '';
+			showMapboxToken = false;
+			toast.success('Mapbox token saved to device');
+		} catch {
+			console.error('Failed to save Mapbox token');
+			toast.error('Failed to save Mapbox token');
+		} finally {
+			savingMapboxToken = false;
+		}
+	}
+
+	async function handleRemoveMapboxToken() {
+		savingMapboxToken = true;
+		try {
+			await writeNavigationParam('MapboxPublicKey', '', 'String');
+			toast.success('Mapbox token removed from device');
+		} catch {
+			console.error('Failed to remove Mapbox token');
+			toast.error('Failed to remove Mapbox token');
+		} finally {
+			savingMapboxToken = false;
+		}
+	}
+
+	async function handleNavigationToggle(
+		key: 'NavigationEnabled' | 'NavigationModelIntent',
+		enabled: boolean
+	) {
+		savingNavigationSetting = key;
+		try {
+			await writeNavigationParam(key, enabled, 'Bool');
+			toast.success('Navigation setting updated');
+		} catch (e) {
+			console.error(`Failed to update ${key}`, e);
+			toast.error('Failed to update navigation setting');
+		} finally {
+			savingNavigationSetting = null;
+		}
+	}
+
 	function formatTimeAgo(timestamp: string | null) {
 		if (!timestamp) return 'Never';
 		try {
@@ -474,7 +585,7 @@
 
 <SettingsPageShell
 	title="Maps"
-	description="Manage offline OpenStreetMap data on your device"
+	description="Manage navigation and offline OpenStreetMap data on your device"
 	syncStatus={!loadingOsmParams ? sync.status : undefined}
 	loading={loadingOsmParams}
 	onRefresh={async () => {
@@ -546,8 +657,127 @@
 		{/await}
 	{:else}
 		<div>
-			<!-- ── Current Map Section ──────────────────────────────── -->
+			<!-- ── Navigation Section ───────────────────────────────── -->
 			<div class="px-4">
+				<p class="text-[0.9375rem] font-medium text-[var(--sl-text-1)]">Navigation</p>
+				<p class="mt-2 text-[0.8125rem] font-[450] text-[var(--sl-text-2)]">
+					Configure Mapbox routing and model turn intent
+				</p>
+			</div>
+
+			<div
+				class="mt-3 overflow-hidden rounded-xl border border-[var(--sl-border)] bg-[var(--sl-bg-surface)]"
+			>
+				<div class="space-y-3 px-4 py-4">
+					<div class="flex items-center gap-2">
+						<KeyRound size={16} class="text-[var(--sl-text-3)]" />
+						<div>
+							<p class="text-[0.8125rem] font-medium text-[var(--sl-text-1)]">
+								Mapbox public token
+							</p>
+							<p class="text-[0.75rem] font-[450] text-[var(--sl-text-3)]">
+								{mapboxPublicKey ? `Configured ••••${mapboxPublicKey.slice(-4)}` : 'Not configured'}
+							</p>
+						</div>
+					</div>
+
+					<div class="join flex w-full">
+						<input
+							type={showMapboxToken ? 'text' : 'password'}
+							class="input input-sm join-item min-w-0 flex-1 border-[var(--sl-border)] bg-[var(--sl-bg)]"
+							placeholder="Paste a pk.* public token"
+							autocomplete="off"
+							spellcheck="false"
+							bind:value={mapboxTokenInput}
+							disabled={savingMapboxToken}
+						/>
+						<button
+							class="btn join-item border-[var(--sl-border)] btn-sm"
+							type="button"
+							aria-label={showMapboxToken ? 'Hide token' : 'Show token'}
+							onclick={() => (showMapboxToken = !showMapboxToken)}
+						>
+							{#if showMapboxToken}<EyeOff size={15} />{:else}<Eye size={15} />{/if}
+						</button>
+						<button
+							class="btn join-item btn-sm btn-primary"
+							type="button"
+							disabled={savingMapboxToken || !mapboxTokenInput.trim()}
+							onclick={handleSaveMapboxToken}
+						>
+							{#if savingMapboxToken}<Loader2 size={14} class="animate-spin" />{/if}
+							Save
+						</button>
+					</div>
+					<p class="text-[0.75rem] font-[450] text-[var(--sl-text-3)]">
+						Only a Mapbox public token beginning with pk. is accepted. The token is excluded from
+						browser storage and device logs.
+					</p>
+					{#if mapboxPublicKey}
+						<button
+							class="text-[0.75rem] text-red-600 hover:text-red-700 disabled:opacity-40 dark:text-red-400"
+							disabled={savingMapboxToken}
+							onclick={handleRemoveMapboxToken}
+						>
+							Remove token
+						</button>
+					{/if}
+				</div>
+
+				<div
+					class="flex items-center justify-between border-t border-[var(--sl-border-muted)] px-4 py-3.5"
+				>
+					<div class="min-w-0 pr-4">
+						<div class="flex items-center gap-2">
+							<Navigation size={16} class="text-[var(--sl-text-3)]" />
+							<p class="text-[0.8125rem] font-medium text-[var(--sl-text-1)]">Navigation</p>
+						</div>
+						<p class="mt-1 text-[0.75rem] font-[450] text-[var(--sl-text-3)]">
+							A route needs Wi-Fi or cellular data to load. Loaded guidance continues after a
+							connection loss.
+						</p>
+					</div>
+					<input
+						type="checkbox"
+						class="toggle toggle-primary toggle-sm"
+						checked={navigationEnabled}
+						disabled={savingNavigationSetting !== null}
+						onchange={(event) =>
+							handleNavigationToggle(
+								'NavigationEnabled',
+								(event.currentTarget as HTMLInputElement).checked
+							)}
+					/>
+				</div>
+
+				<div
+					class="flex items-center justify-between border-t border-[var(--sl-border-muted)] px-4 py-3.5"
+				>
+					<div class="min-w-0 pr-4">
+						<p class="text-[0.8125rem] font-medium text-[var(--sl-text-1)]">
+							Navigation intent for model
+						</p>
+						<p class="mt-1 text-[0.75rem] font-[450] text-[var(--sl-text-3)]">
+							Sends supported left and right maneuvers to the existing model desire input. Turn
+							signals stay under manual control.
+						</p>
+					</div>
+					<input
+						type="checkbox"
+						class="toggle toggle-primary toggle-sm"
+						checked={navigationModelIntent}
+						disabled={!navigationEnabled || savingNavigationSetting !== null}
+						onchange={(event) =>
+							handleNavigationToggle(
+								'NavigationModelIntent',
+								(event.currentTarget as HTMLInputElement).checked
+							)}
+					/>
+				</div>
+			</div>
+
+			<!-- ── Current Map Section ──────────────────────────────── -->
+			<div class="mt-12 px-4">
 				<p class="text-[0.9375rem] font-medium text-[var(--sl-text-1)]">Current Map</p>
 				<p class="mt-2 text-[0.8125rem] font-[450] text-[var(--sl-text-2)]">
 					Offline map data downloaded on device
