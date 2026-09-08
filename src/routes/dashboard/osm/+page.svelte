@@ -1,7 +1,15 @@
 <script lang="ts">
 	import { onMount, untrack } from 'svelte';
 	import { fade } from 'svelte/transition';
-	import { Map as MapIcon, Download, AlertCircle, Loader2, RefreshCw } from 'lucide-svelte';
+	import {
+		Map as MapIcon,
+		Download,
+		AlertCircle,
+		Loader2,
+		RefreshCw,
+		Navigation,
+		X
+	} from 'lucide-svelte';
 	import { deviceState } from '$lib/stores/device.svelte';
 	import { setDeviceParams, checkDeviceStatus, fetchSettingsAsync } from '$lib/api/device';
 	import { logtoClient, authState } from '$lib/logto/auth.svelte';
@@ -15,6 +23,15 @@
 	import { createSyncStatus } from '$lib/utils/syncStatus.svelte';
 	import { batchPush } from '$lib/stores/batchPush.svelte';
 	import { toast } from 'svelte-sonner';
+	import { Athenav0Client } from '$lib/api/client';
+
+	interface MapboxFeature {
+		id: string;
+		name: string;
+		details: string;
+		latitude: number;
+		longitude: number;
+	}
 
 	const OSM_CACHE_PREFIX = 'sunnylink_osm_';
 	const OSM_CACHE_TTL = 48 * 60 * 60 * 1000; // 48 hours
@@ -61,6 +78,8 @@
 		'OsmDownloadedDate',
 		'OsmLocal'
 	];
+	const NAVIGATION_PARAMS = ['MapboxPublicKey', 'NavDestination'];
+	const MAP_PARAMS = [...OSM_PARAMS, ...NAVIGATION_PARAMS];
 
 	let countries: OSMRegion[] = $state([]);
 	let states: OSMRegion[] = $state([]);
@@ -70,6 +89,15 @@
 	let clearingCache = $state(false);
 	let clearCacheModalOpen = $state(false);
 	let error = $state<string | null>(null);
+	let mapboxToken = $state('');
+	let tokenDevice = $state('');
+	let savingToken = $state(false);
+	let destinationQuery = $state('');
+	let destinationResults = $state<MapboxFeature[]>([]);
+	let selectedDestination = $state<MapboxFeature | null>(null);
+	let searchingDestination = $state(false);
+	let settingDestination = $state(false);
+	let cancellingNavigation = $state(false);
 
 	// Sync status indicator (consistent with settings pages)
 	let batchActive = $derived(
@@ -166,6 +194,31 @@
 	let osmLocalParam = $derived(
 		deviceState.selectedDeviceId ? getParamValue(deviceState.selectedDeviceId, 'OsmLocal') : null
 	);
+	let currentMapboxToken = $derived(
+		deviceState.selectedDeviceId
+			? String(getParamValue(deviceState.selectedDeviceId, 'MapboxPublicKey') || '')
+			: ''
+	);
+	let currentDestination = $derived.by(() => {
+		if (!deviceState.selectedDeviceId) return null;
+		const destination = getParamValue(deviceState.selectedDeviceId, 'NavDestination');
+		return destination &&
+			typeof destination === 'object' &&
+			Number.isFinite(Number(destination.latitude)) &&
+			Number.isFinite(Number(destination.longitude)) &&
+			(Number(destination.latitude) !== 0 || Number(destination.longitude) !== 0)
+			? destination
+			: null;
+	});
+
+	$effect(() => {
+		const deviceId = deviceState.selectedDeviceId || '';
+		const token = currentMapboxToken;
+		if (deviceId !== tokenDevice || (!mapboxToken && token)) {
+			mapboxToken = token;
+			tokenDevice = deviceId;
+		}
+	});
 
 	let hasMap = $derived(!!currentCountryName);
 
@@ -204,14 +257,14 @@
 		if (!silent) loadingOsmParams = true;
 		try {
 			const controller = new AbortController();
-			const res = await fetchSettingsAsync(deviceId, OSM_PARAMS, token, {
+			const res = await fetchSettingsAsync(deviceId, MAP_PARAMS, token, {
 				maxPollTimeMs: 8000,
 				signal: controller.signal
 			});
 
 			if (res.items) {
 				const existing = deviceState.deviceSettings[deviceId] || [];
-				const osmParamsSet = new Set(OSM_PARAMS);
+				const osmParamsSet = new Set(MAP_PARAMS);
 
 				// Remove old versions of these params
 				const filtered = existing.filter((i) => i.key && !osmParamsSet.has(i.key));
@@ -219,7 +272,10 @@
 				deviceState.deviceSettings[deviceId] = [...filtered, ...res.items];
 
 				// Persist to cache for SWR on next visit
-				saveOsmCache(deviceId, res.items);
+				saveOsmCache(
+					deviceId,
+					res.items.filter((item) => item.key && OSM_PARAMS.includes(item.key))
+				);
 			}
 		} catch (e) {
 			console.error('Failed to fetch OSM params', e);
@@ -450,6 +506,126 @@
 		}
 	}
 
+	async function handleSaveMapboxToken() {
+		if (!deviceState.selectedDeviceId || !logtoClient) return;
+		const value = mapboxToken.trim();
+		if (!value.startsWith('pk.')) {
+			toast.error('Mapbox Public Token must start with pk.');
+			return;
+		}
+		const token = await logtoClient.getIdToken();
+		if (!token) return;
+		savingToken = true;
+		try {
+			await setDeviceParams(
+				deviceState.selectedDeviceId,
+				[
+					{
+						key: 'MapboxPublicKey',
+						value: encodeParamValue({ key: 'MapboxPublicKey', value, type: 'String' }),
+						is_compressed: false
+					}
+				],
+				token
+			);
+			toast.success('Mapbox Public Token saved to device');
+		} catch (e) {
+			console.error('Failed to save Mapbox token', e);
+			toast.error('Failed to save Mapbox Public Token');
+		} finally {
+			savingToken = false;
+		}
+	}
+
+	async function searchDestination() {
+		const query = destinationQuery.trim();
+		const token = mapboxToken.trim() || currentMapboxToken;
+		if (!query || !token.startsWith('pk.')) {
+			toast.error('Save a valid Mapbox Public Token before searching');
+			return;
+		}
+		searchingDestination = true;
+		selectedDestination = null;
+		try {
+			const params = new URLSearchParams({
+				q: query,
+				access_token: token,
+				limit: '5',
+				language: navigator.language || 'en'
+			});
+			const response = await fetch(`https://api.mapbox.com/search/geocode/v6/forward?${params}`);
+			if (!response.ok) throw new Error(`Mapbox search failed (${response.status})`);
+			const data = await response.json();
+			destinationResults = (data.features || []).map((feature: any) => ({
+				id: feature.id,
+				name: feature.properties?.name || feature.properties?.full_address || query,
+				details: feature.properties?.full_address || feature.properties?.place_formatted || '',
+				longitude: feature.geometry.coordinates[0],
+				latitude: feature.geometry.coordinates[1]
+			}));
+			if (destinationResults.length === 0) toast.info('No destinations found');
+		} catch (e) {
+			console.error('Failed to search destination', e);
+			toast.error('Destination search failed');
+		} finally {
+			searchingDestination = false;
+		}
+	}
+
+	async function handleSetDestination() {
+		if (!deviceState.selectedDeviceId || !selectedDestination || !logtoClient) return;
+		const token = await logtoClient.getIdToken();
+		if (!token) return;
+		settingDestination = true;
+		try {
+			const result = await Athenav0Client.POST('/navigation/{deviceId}/set_destination', {
+				params: { path: { deviceId: deviceState.selectedDeviceId } },
+				body: {
+					latitude: selectedDestination.latitude,
+					longitude: selectedDestination.longitude,
+					place_name: selectedDestination.name,
+					place_details: selectedDestination.details
+				},
+				headers: { Authorization: `Bearer ${token}` }
+			});
+			if (!result.response.ok)
+				throw new Error(`Set destination failed (${result.response.status})`);
+			toast.success('Navigation destination sent to device');
+			destinationResults = [];
+			selectedDestination = null;
+			destinationQuery = '';
+			await fetchOsmParams(deviceState.selectedDeviceId, token, true);
+		} catch (e) {
+			console.error('Failed to set destination', e);
+			toast.error('Failed to set navigation destination');
+		} finally {
+			settingDestination = false;
+		}
+	}
+
+	async function handleCancelNavigation() {
+		if (!deviceState.selectedDeviceId || !logtoClient) return;
+		const token = await logtoClient.getIdToken();
+		if (!token) return;
+		cancellingNavigation = true;
+		try {
+			const result = await Athenav0Client.POST('/navigation/{deviceId}/set_destination', {
+				params: { path: { deviceId: deviceState.selectedDeviceId } },
+				body: { latitude: 0, longitude: 0 },
+				headers: { Authorization: `Bearer ${token}` }
+			});
+			if (!result.response.ok)
+				throw new Error(`Cancel navigation failed (${result.response.status})`);
+			toast.success('Navigation cancelled');
+			await fetchOsmParams(deviceState.selectedDeviceId, token, true);
+		} catch (e) {
+			console.error('Failed to cancel navigation', e);
+			toast.error('Failed to cancel navigation');
+		} finally {
+			cancellingNavigation = false;
+		}
+	}
+
 	function formatTimeAgo(timestamp: string | null) {
 		if (!timestamp) return 'Never';
 		try {
@@ -546,8 +722,128 @@
 		{/await}
 	{:else}
 		<div>
-			<!-- ── Current Map Section ──────────────────────────────── -->
+			<!-- ── Mapbox Navigation ─────────────────────────────── -->
 			<div class="px-4">
+				<p class="text-[0.9375rem] font-medium text-[var(--sl-text-1)]">Mapbox Navigation</p>
+				<p class="mt-2 text-[0.8125rem] font-[450] text-[var(--sl-text-2)]">
+					Configure routing and send a one-time destination to your device
+				</p>
+			</div>
+
+			<div
+				class="mt-3 overflow-hidden rounded-xl border border-[var(--sl-border)] bg-[var(--sl-bg-surface)]"
+			>
+				<div class="space-y-3 px-4 py-4">
+					<label class="block">
+						<span class="text-[0.8125rem] font-medium text-[var(--sl-text-1)]"
+							>Mapbox Public Token</span
+						>
+						<input
+							type="password"
+							class="input-bordered input mt-2 w-full"
+							placeholder="pk.ey..."
+							autocomplete="off"
+							bind:value={mapboxToken}
+							disabled={savingToken}
+						/>
+					</label>
+					<div class="flex justify-end">
+						<button
+							class="btn btn-sm btn-primary"
+							onclick={handleSaveMapboxToken}
+							disabled={savingToken || !mapboxToken.trim()}
+						>
+							{#if savingToken}<Loader2 size={14} class="animate-spin" />{/if}
+							Save Token
+						</button>
+					</div>
+				</div>
+
+				<div class="border-t border-[var(--sl-border-muted)] px-4 py-4">
+					{#if currentDestination}
+						<div
+							class="mb-4 flex items-start justify-between gap-4 rounded-lg bg-[var(--sl-bg-subtle)] p-3"
+						>
+							<div class="min-w-0">
+								<p class="text-[0.8125rem] font-medium text-[var(--sl-text-1)]">
+									Active destination
+								</p>
+								<p class="mt-1 truncate text-[0.75rem] text-[var(--sl-text-2)]">
+									{currentDestination.place_name ||
+										currentDestination.place_details ||
+										`${currentDestination.latitude}, ${currentDestination.longitude}`}
+								</p>
+							</div>
+							<button
+								class="btn btn-outline btn-sm btn-error"
+								onclick={handleCancelNavigation}
+								disabled={cancellingNavigation}
+							>
+								{#if cancellingNavigation}<Loader2 size={14} class="animate-spin" />{:else}<X
+										size={14}
+									/>{/if}
+								Cancel
+							</button>
+						</div>
+					{/if}
+
+					<div class="flex gap-2">
+						<input
+							type="search"
+							class="input-bordered input min-w-0 flex-1"
+							placeholder="Search an address or place"
+							bind:value={destinationQuery}
+							onkeydown={(event) => event.key === 'Enter' && searchDestination()}
+						/>
+						<button
+							class="btn btn-primary"
+							onclick={searchDestination}
+							disabled={searchingDestination || !destinationQuery.trim()}
+						>
+							{#if searchingDestination}<Loader2 size={14} class="animate-spin" />{:else}<Navigation
+									size={14}
+								/>{/if}
+							Search
+						</button>
+					</div>
+
+					{#if destinationResults.length > 0}
+						<div
+							class="mt-3 divide-y divide-[var(--sl-border-muted)] overflow-hidden rounded-lg border border-[var(--sl-border-muted)]"
+						>
+							{#each destinationResults as destination}
+								<button
+									class="block w-full px-3 py-3 text-left transition-colors hover:bg-[var(--sl-bg-subtle)] {selectedDestination?.id ===
+									destination.id
+										? 'bg-[var(--sl-bg-subtle)]'
+										: ''}"
+									onclick={() => (selectedDestination = destination)}
+								>
+									<p class="text-[0.8125rem] font-medium text-[var(--sl-text-1)]">
+										{destination.name}
+									</p>
+									<p class="mt-0.5 text-[0.75rem] text-[var(--sl-text-3)]">{destination.details}</p>
+								</button>
+							{/each}
+						</div>
+						<div class="mt-3 flex justify-end">
+							<button
+								class="btn btn-sm btn-primary"
+								onclick={handleSetDestination}
+								disabled={!selectedDestination || settingDestination}
+							>
+								{#if settingDestination}<Loader2 size={14} class="animate-spin" />{:else}<Navigation
+										size={14}
+									/>{/if}
+								Start Navigation
+							</button>
+						</div>
+					{/if}
+				</div>
+			</div>
+
+			<!-- ── Current Map Section ──────────────────────────────── -->
+			<div class="mt-12 px-4">
 				<p class="text-[0.9375rem] font-medium text-[var(--sl-text-1)]">Current Map</p>
 				<p class="mt-2 text-[0.8125rem] font-[450] text-[var(--sl-text-2)]">
 					Offline map data downloaded on device
