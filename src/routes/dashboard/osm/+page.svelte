@@ -24,6 +24,7 @@
 	import { batchPush } from '$lib/stores/batchPush.svelte';
 	import { toast } from 'svelte-sonner';
 	import { Athenav0Client } from '$lib/api/client';
+	import { decodeMapboxToken } from '$lib/utils/mapboxTokenCodec';
 
 	interface MapboxFeature {
 		id: string;
@@ -93,6 +94,7 @@
 	let tokenDevice = $state('');
 	let savingToken = $state(false);
 	let destinationQuery = $state('');
+	let destinationCoordinates = $state('');
 	let destinationResults = $state<MapboxFeature[]>([]);
 	let selectedDestination = $state<MapboxFeature | null>(null);
 	let searchingDestination = $state(false);
@@ -508,9 +510,11 @@
 
 	async function handleSaveMapboxToken() {
 		if (!deviceState.selectedDeviceId || !logtoClient) return;
-		const value = mapboxToken.trim();
-		if (!value.startsWith('pk.')) {
-			toast.error('Mapbox Public Token must start with pk.');
+		let value: string;
+		try {
+			value = await decodeMapboxToken(mapboxToken);
+		} catch (error) {
+			toast.error(error instanceof Error ? error.message : 'Invalid Mapbox token or compact code');
 			return;
 		}
 		const token = await logtoClient.getIdToken();
@@ -539,11 +543,14 @@
 
 	async function searchDestination() {
 		const query = destinationQuery.trim();
-		const token = mapboxToken.trim() || currentMapboxToken;
-		if (!query || !token.startsWith('pk.')) {
-			toast.error('Save a valid Mapbox Public Token before searching');
+		let token: string;
+		try {
+			token = await decodeMapboxToken(mapboxToken.trim() || currentMapboxToken);
+		} catch {
+			toast.error('Save a valid Mapbox public token or compact code before searching');
 			return;
 		}
+		if (!query) return;
 		searchingDestination = true;
 		selectedDestination = null;
 		try {
@@ -572,8 +579,8 @@
 		}
 	}
 
-	async function handleSetDestination() {
-		if (!deviceState.selectedDeviceId || !selectedDestination || !logtoClient) return;
+	async function sendDestination(destination: MapboxFeature) {
+		if (!deviceState.selectedDeviceId || !logtoClient) return;
 		const token = await logtoClient.getIdToken();
 		if (!token) return;
 		settingDestination = true;
@@ -581,10 +588,10 @@
 			const result = await Athenav0Client.POST('/navigation/{deviceId}/set_destination', {
 				params: { path: { deviceId: deviceState.selectedDeviceId } },
 				body: {
-					latitude: selectedDestination.latitude,
-					longitude: selectedDestination.longitude,
-					place_name: selectedDestination.name,
-					place_details: selectedDestination.details
+					latitude: destination.latitude,
+					longitude: destination.longitude,
+					place_name: destination.name,
+					place_details: destination.details
 				},
 				headers: { Authorization: `Bearer ${token}` }
 			});
@@ -594,6 +601,7 @@
 			destinationResults = [];
 			selectedDestination = null;
 			destinationQuery = '';
+			destinationCoordinates = '';
 			await fetchOsmParams(deviceState.selectedDeviceId, token, true);
 		} catch (e) {
 			console.error('Failed to set destination', e);
@@ -601,6 +609,47 @@
 		} finally {
 			settingDestination = false;
 		}
+	}
+
+	async function handleSetDestination() {
+		if (selectedDestination) await sendDestination(selectedDestination);
+	}
+
+	async function handleSetCoordinateDestination() {
+		const rawParts = destinationCoordinates
+			.trim()
+			.replace('，', ',')
+			.split(',')
+			.map((part) => part.trim());
+		if (rawParts.length !== 2) {
+			toast.error('Use latitude, longitude; for example 25.0330, 121.5654');
+			return;
+		}
+		const latitude = Number(rawParts[0]!);
+		const longitude = Number(rawParts[1]!);
+		if (
+			!Number.isFinite(latitude) ||
+			!Number.isFinite(longitude) ||
+			latitude < -90 ||
+			latitude > 90 ||
+			longitude < -180 ||
+			longitude > 180
+		) {
+			toast.error('Use latitude, longitude; for example 25.0330, 121.5654');
+			return;
+		}
+		if (latitude === 0 && longitude === 0) {
+			toast.error('0, 0 is reserved for cancelling navigation');
+			return;
+		}
+
+		await sendDestination({
+			id: `coordinates:${latitude},${longitude}`,
+			name: 'Coordinate destination',
+			details: `${latitude}, ${longitude}`,
+			latitude,
+			longitude
+		});
 	}
 
 	async function handleCancelNavigation() {
@@ -736,16 +785,19 @@
 				<div class="space-y-3 px-4 py-4">
 					<label class="block">
 						<span class="text-[0.8125rem] font-medium text-[var(--sl-text-1)]"
-							>Mapbox Public Token</span
+							>Mapbox Public Token or Compact Code</span
 						>
 						<input
 							type="password"
 							class="input-bordered input mt-2 w-full"
-							placeholder="pk.ey..."
+							placeholder="pk.ey... or M0/M1..."
 							autocomplete="off"
 							bind:value={mapboxToken}
 							disabled={savingToken}
 						/>
+						<span class="mt-1.5 block text-[0.75rem] text-[var(--sl-text-3)]">
+							Compact codes are decoded before the original pk. token is saved to the device.
+						</span>
 					</label>
 					<div class="flex justify-end">
 						<button
@@ -786,6 +838,41 @@
 							</button>
 						</div>
 					{/if}
+
+					<label class="block">
+						<span class="text-[0.8125rem] font-medium text-[var(--sl-text-1)]"
+							>Destination coordinates</span
+						>
+						<span class="mt-1 block text-[0.75rem] text-[var(--sl-text-3)]">
+							Enter latitude first, then longitude. Mapbox search is not required.
+						</span>
+						<div class="mt-2 flex gap-2">
+							<input
+								type="text"
+								inputmode="decimal"
+								class="input-bordered input min-w-0 flex-1"
+								placeholder="25.0330, 121.5654"
+								bind:value={destinationCoordinates}
+								onkeydown={(event) => event.key === 'Enter' && handleSetCoordinateDestination()}
+							/>
+							<button
+								class="btn btn-primary"
+								onclick={handleSetCoordinateDestination}
+								disabled={settingDestination || !destinationCoordinates.trim()}
+							>
+								{#if settingDestination}<Loader2 size={14} class="animate-spin" />{:else}<Navigation
+										size={14}
+									/>{/if}
+								Start
+							</button>
+						</div>
+					</label>
+
+					<div class="my-4 flex items-center gap-3" aria-hidden="true">
+						<div class="h-px flex-1 bg-[var(--sl-border-muted)]"></div>
+						<span class="text-[0.75rem] text-[var(--sl-text-3)]">or search by address</span>
+						<div class="h-px flex-1 bg-[var(--sl-border-muted)]"></div>
+					</div>
 
 					<div class="flex gap-2">
 						<input
